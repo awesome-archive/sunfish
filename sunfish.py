@@ -4,7 +4,7 @@
 from __future__ import print_function
 import re, sys, time
 from itertools import count
-from collections import OrderedDict, namedtuple
+from collections import namedtuple
 
 ###############################################################################
 # Piece-Square tables. Tune these to change sunfish's behaviour
@@ -109,11 +109,12 @@ MATE_LOWER = piece['K'] - 10*piece['Q']
 MATE_UPPER = piece['K'] + 10*piece['Q']
 
 # The table size is the maximum number of elements in the transposition table.
-TABLE_SIZE = 1e8
+TABLE_SIZE = 1e7
 
 # Constants for tuning search
-QS_LIMIT = 150
-EVAL_ROUGHNESS = 20
+QS_LIMIT = 219
+EVAL_ROUGHNESS = 13
+DRAW_TEST = True
 
 
 ###############################################################################
@@ -144,7 +145,8 @@ class Position(namedtuple('Position', 'board score wc bc ep kp')):
                     # Pawn move, double move and capture
                     if p == 'P' and d in (N, N+N) and q != '.': break
                     if p == 'P' and d == N+N and (i < A1+N or self.board[i+N] != '.'): break
-                    if p == 'P' and d in (N+W, N+E) and q == '.' and j not in (self.ep, self.kp): break
+                    if p == 'P' and d in (N+W, N+E) and q == '.' \
+                            and j not in (self.ep, self.kp, self.kp-1, self.kp+1): break
                     # Move it
                     yield (i, j)
                     # Stop crawlers from sliding, and sliding after captures
@@ -230,30 +232,11 @@ class Position(namedtuple('Position', 'board score wc bc ep kp')):
 # lower <= s(pos) <= upper
 Entry = namedtuple('Entry', 'lower upper')
 
-# The normal OrderedDict doesn't update the position of a key in the list,
-# when the value is changed.
-class LRUCache:
-    '''Store items in the order the keys were last added'''
-    def __init__(self, size):
-        self.od = OrderedDict()
-        self.size = size
-
-    def get(self, key, default=None):
-        try: self.od.move_to_end(key)
-        except KeyError: return default
-        return self.od[key]
-
-    def __setitem__(self, key, value):
-        try: del self.od[key]
-        except KeyError:
-            if len(self.od) == self.size:
-                self.od.popitem(last=False)
-        self.od[key] = value
-
 class Searcher:
     def __init__(self):
-        self.tp_score = LRUCache(TABLE_SIZE)
-        self.tp_move = LRUCache(TABLE_SIZE)
+        self.tp_score = {}
+        self.tp_move = {}
+        self.history = set()
         self.nodes = 0
 
     def bound(self, pos, gamma, depth, root=True):
@@ -262,7 +245,9 @@ class Searcher:
                 gamma <= r <= s(pos)   if gamma <= s(pos)"""
         self.nodes += 1
 
-        # Depth <= 0 is QSearch. Here any position is searched as deeply as is needed for calmness, and so there is no reason to keep different depths in the transposition table.
+        # Depth <= 0 is QSearch. Here any position is searched as deeply as is needed for
+        # calmness, and from this point on there is no difference in behaviour depending on
+        # depth, so so there is no reason to keep different depths in the transposition table.
         depth = max(depth, 0)
 
         # Sunfish is a king-capture engine, so we should always check if we
@@ -271,6 +256,17 @@ class Searcher:
         # or able to capture the opponent king.
         if pos.score <= -MATE_LOWER:
             return -MATE_UPPER
+
+        # We detect 3-fold captures by comparing against previously
+        # _actually played_ positions.
+        # Note that we need to do this before we look in the table, as the
+        # position may have been previously reached with a different score.
+        # This is what prevents a search instability.
+        # FIXME: This is not true, since other positions will be affected by
+        # the new values for all the drawn positions.
+        if DRAW_TEST:
+            if not root and pos in self.history:
+                return 0
 
         # Look in the table if we have already searched this position before.
         # We also need to be sure, that the stored search was over the same
@@ -287,10 +283,10 @@ class Searcher:
         # Generator of moves to search in order.
         # This allows us to define the moves, but only calculate them if needed.
         def moves():
-            # First try not moving at all
+            # First try not moving at all. We only do this if there is at least one major piece left on the board, since otherwise zugzwangs are too dangerous.
             if depth > 0 and not root and any(c in pos.board for c in 'RBNQ'):
                 yield None, -self.bound(pos.nullmove(), 1-gamma, depth-3, root=False)
-            # For QSearch we have a different kind of null-move
+            # For QSearch we have a different kind of null-move, namely we can just stop and not capture anythign else.
             if depth == 0:
                 yield None, pos.score
             # Then killer move. We search it twice, but the tp will fix things for us. Note, we don't have to check for legality, since we've already done it before. Also note that in QS the killer must be a capture, otherwise we will be non deterministic.
@@ -299,6 +295,7 @@ class Searcher:
                 yield killer, -self.bound(pos.move(killer), 1-gamma, depth-1, root=False)
             # Then all the other moves
             for move in sorted(pos.gen_moves(), key=pos.value, reverse=True):
+                # If depth == 0 we only try moves with high intrinsic score (captures and promotions). Otherwise we do all moves.
                 if depth > 0 or pos.value(move) >= QS_LIMIT:
                     yield move, -self.bound(pos.move(move), 1-gamma, depth-1, root=False)
 
@@ -307,6 +304,8 @@ class Searcher:
         for move, score in moves():
             best = max(best, score)
             if best >= gamma:
+                # Clear before setting, so we always have a value
+                if len(self.tp_move) > TABLE_SIZE: self.tp_move.clear()
                 # Save the move for pv construction and killer heuristic
                 self.tp_move[pos] = move
                 break
@@ -327,25 +326,30 @@ class Searcher:
                 in_check = is_dead(pos.nullmove())
                 best = -MATE_UPPER if in_check else 0
 
+        # Clear before setting, so we always have a value
+        if len(self.tp_score) > TABLE_SIZE: self.tp_score.clear()
         # Table part 2
         if best >= gamma:
-            self.tp_score[(pos, depth, root)] = Entry(best, entry.upper)
+            self.tp_score[pos, depth, root] = Entry(best, entry.upper)
         if best < gamma:
-            self.tp_score[(pos, depth, root)] = Entry(entry.lower, best)
+            self.tp_score[pos, depth, root] = Entry(entry.lower, best)
 
         return best
 
     # secs over maxn is a breaking change. Can we do this?
     # I guess I could send a pull request to deep pink
     # Why include secs at all?
-    def _search(self, pos):
+    def search(self, pos, history=()):
         """ Iterative deepening MTD-bi search """
         self.nodes = 0
+        if DRAW_TEST:
+            self.history = set(history)
+            # print('# Clearing table due to new history')
+            self.tp_score.clear()
 
         # In finished games, we could potentially go far enough to cause a recursion
         # limit exception. Hence we bound the ply.
         for depth in range(1, 1000):
-            self.depth = depth
             # The inner loop is a binary search on the score of the position.
             # Inv: lower <= score <= upper
             # 'while lower != upper' would work, but play tests show a margin of 20 plays better.
@@ -359,19 +363,10 @@ class Searcher:
                     upper = score
             # We want to make sure the move to play hasn't been kicked out of the table,
             # So we make another call that must always fail high and thus produce a move.
-            score = self.bound(pos, lower, depth)
-
-            # Yield so the user may inspect the search
-            yield
-
-    def search(self, pos, secs):
-        start = time.time()
-        for _ in self._search(pos):
-            if time.time() - start > secs:
-                break
-        # If the game hasn't finished we can retrieve our move from the
-        # transposition table.
-        return self.tp_move.get(pos), self.tp_score.get((pos, self.depth, True)).lower
+            self.bound(pos, lower, depth)
+            # If the game hasn't finished we can retrieve our move from the
+            # transposition table.
+            yield depth, self.tp_move.get(pos), self.tp_score.get((pos, depth, True)).lower
 
 
 ###############################################################################
@@ -381,11 +376,6 @@ class Searcher:
 # Python 2 compatability
 if sys.version_info[0] == 2:
     input = raw_input
-    class NewOrderedDict(OrderedDict):
-        def move_to_end(self, key):
-            value = self.pop(key)
-            self[key] = value
-    OrderedDict = NewOrderedDict
 
 
 def parse(c):
@@ -408,36 +398,39 @@ def print_pos(pos):
 
 
 def main():
-    pos = Position(initial, 0, (True,True), (True,True), 0, 0)
+    hist = [Position(initial, 0, (True,True), (True,True), 0, 0)]
     searcher = Searcher()
     while True:
-        print_pos(pos)
+        print_pos(hist[-1])
 
-        if pos.score <= -MATE_LOWER:
+        if hist[-1].score <= -MATE_LOWER:
             print("You lost")
             break
 
         # We query the user until she enters a (pseudo) legal move.
         move = None
-        while move not in pos.gen_moves():
+        while move not in hist[-1].gen_moves():
             match = re.match('([a-h][1-8])'*2, input('Your move: '))
             if match:
                 move = parse(match.group(1)), parse(match.group(2))
             else:
                 # Inform the user when invalid input (e.g. "help") is entered
                 print("Please enter a move like g8f6")
-        pos = pos.move(move)
+        hist.append(hist[-1].move(move))
 
         # After our move we rotate the board and print it again.
         # This allows us to see the effect of our move.
-        print_pos(pos.rotate())
+        print_pos(hist[-1].rotate())
 
-        if pos.score <= -MATE_LOWER:
+        if hist[-1].score <= -MATE_LOWER:
             print("You won")
             break
 
         # Fire up the engine to look for a move.
-        move, score = searcher.search(pos, secs=2)
+        start = time.time()
+        for _depth, move, score in searcher.search(hist[-1], hist):
+            if time.time() - start > 1:
+                break
 
         if score == MATE_UPPER:
             print("Checkmate!")
@@ -445,7 +438,7 @@ def main():
         # The black player moves from a rotated position, so we have to
         # 'back rotate' the move before printing it.
         print("My move:", render(119-move[0]) + render(119-move[1]))
-        pos = pos.move(move)
+        hist.append(hist[-1].move(move))
 
 
 if __name__ == '__main__':
